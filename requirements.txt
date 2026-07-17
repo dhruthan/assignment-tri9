@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+sqlalchemy
+pydantic
+PyMuPDF
+tinydb
+python-multipart
+httpx
+requests
+Pillow
+pytesseract
+img2table
