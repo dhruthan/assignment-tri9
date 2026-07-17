@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import io
 import os
@@ -7,9 +8,12 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import fitz
+import requests
 
 log = logging.getLogger(__name__)
 
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+UNLIMITED_OCR_MODEL = os.getenv("UNLIMITED_OCR_MODEL", "frob/unlimited-ocr:q8_0")
 TESSERACT_DPI = int(os.getenv("TESSERACT_DPI", "300"))
 
 HEADING_RE = re.compile(r'^(\d+(?:\.\d+)*)\.?\s+(.+)$')
@@ -42,6 +46,85 @@ class ParsedSection:
 
     def compute_logical_id(self):
         self.logical_id = f"sec_{self.section_number}" if self.section_number else "title"
+
+
+
+def _ocr_page_unlimited(image_bytes: bytes) -> str:
+    img_b64 = base64.b64encode(image_bytes).decode()
+
+    # use the prompt format from baidu's repo: "document parsing."
+    payload = {
+        "model": UNLIMITED_OCR_MODEL,
+        "messages": [{
+            "role": "user",
+            "content": "document parsing.",
+            "images": [img_b64],
+        }],
+        "stream": False,
+    }
+    resp = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=180)
+    if resp.status_code != 200:
+        log.error(f"Ollama returned {resp.status_code}: {resp.text[:500]}")
+        resp.raise_for_status()
+    text = resp.json()["message"]["content"]
+    # strip markdown fences if model wraps output
+    text = re.sub(r'^```(?:markdown)?\s*\n?', '', text)
+    text = re.sub(r'\n?```\s*$', '', text)
+    return text.strip()
+
+
+def _unload_all_models():
+    """unload every loaded model from ollama to free VRAM for OCR"""
+    import time
+    try:
+        # check what's currently loaded
+        r = requests.get(f"{OLLAMA_URL}/api/ps", timeout=5)
+        if r.status_code == 200:
+            loaded = r.json().get("models", [])
+            for m in loaded:
+                name = m.get("name", "")
+                log.info(f"unloading {name} to free VRAM...")
+                requests.post(f"{OLLAMA_URL}/api/generate", json={
+                    "model": name, "keep_alive": 0
+                }, timeout=15)
+            if loaded:
+                time.sleep(3)  # give VRAM a moment to actually free
+    except Exception as e:
+        log.warning(f"couldn't unload models: {e}")
+
+
+def _unlimited_ocr_available() -> bool:
+    """check if ollama has the unlimited-ocr model pulled"""
+    try:
+        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
+        r.raise_for_status()
+        models = [m["name"] for m in r.json().get("models", [])]
+        for m in models:
+            if "unlimited-ocr" in m.lower():
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def extract_with_unlimited_ocr(pdf_path: str) -> list[PageText]:
+    _unload_all_models()
+
+    doc = fitz.open(pdf_path)
+    pages = []
+    ocr_dpi = 150
+    log.info(f"OCR'ing {len(doc)} pages with Unlimited-OCR ({UNLIMITED_OCR_MODEL}) at {ocr_dpi} DPI")
+
+    for i in range(len(doc)):
+        page = doc[i]
+        pix = page.get_pixmap(dpi=ocr_dpi)
+        img_bytes = pix.tobytes("png")
+        text = _ocr_page_unlimited(img_bytes)
+        pages.append(PageText(page_num=i + 1, text=text))
+        log.info(f"  page {i+1}: {len(text)} chars")
+
+    doc.close()
+    return pages
 
 
 
@@ -78,7 +161,6 @@ def _extract_tables_img2table(pdf_path: str) -> dict[int, list[str]]:
 
 
 def extract_with_tesseract(pdf_path: str) -> list[PageText]:
-    """tesseract for text + img2table for tables"""
     table_data = _extract_tables_img2table(pdf_path)
     doc = fitz.open(pdf_path)
     pages = []
@@ -131,15 +213,31 @@ def _pdf_has_text_layer(pdf_path: str) -> bool:
 def extract_pages(pdf_path: str, use_ocr: bool = False) -> list[PageText]:
 
     if use_ocr:
-        log.info("OCR forced via flag, using Tesseract")
-        return extract_with_tesseract(pdf_path)
+        if _unlimited_ocr_available():
+            try:
+                log.info("using Baidu Unlimited-OCR via Ollama")
+                return extract_with_unlimited_ocr(pdf_path)
+            except Exception as e:
+                log.error(f"Unlimited-OCR failed: {e}, falling back to Tesseract")
+                return extract_with_tesseract(pdf_path)
+        else:
+            log.info("Unlimited-OCR not in Ollama, using Tesseract")
+            return extract_with_tesseract(pdf_path)
 
     if _pdf_has_text_layer(pdf_path):
         log.info("using PyMuPDF (text layer found)")
         return extract_with_pymupdf(pdf_path)
     else:
-        log.info("scanned PDF, using Tesseract OCR")
-        return extract_with_tesseract(pdf_path)
+        if _unlimited_ocr_available():
+            try:
+                log.info("scanned PDF — using Unlimited-OCR")
+                return extract_with_unlimited_ocr(pdf_path)
+            except Exception as e:
+                log.error(f"Unlimited-OCR failed: {e}")
+                return extract_with_tesseract(pdf_path)
+        else:
+            log.info("scanned PDF — using Tesseract")
+            return extract_with_tesseract(pdf_path)
 
 
 
@@ -161,6 +259,24 @@ def _find_parent(sec_num, title, sections):
     return title
 
 
+# regex to strip unlimited-ocr bounding box annotations
+# matches lines like: "text [38, 72, 417, 90]The CardioTrack..."
+# or: "header [28, 37, 95, 52]New Scan"
+# or: "title [326, 665, 413, 691]26.5K"
+BBOX_RE = re.compile(r'^(?:text|header|title|table|image)\s*\[[\d,\s]+\]')
+
+
+def _clean_ocr_line(line: str) -> str:
+    m = BBOX_RE.match(line)
+    if m:
+        return line[m.end():].strip()
+    # also handle <table>...</table> blocks — flatten to text
+    if '<table>' in line:
+        cleaned = re.sub(r'</?table>', '', line)
+        return cleaned.strip()
+    return line
+
+
 def parse_tree(pages: list[PageText]):
     full_text = '\n'.join(p.text.strip() for p in pages if p.text.strip())
     lines = full_text.split('\n')
@@ -174,6 +290,12 @@ def parse_tree(pages: list[PageText]):
         stripped = line.strip()
         if not stripped:
             continue
+
+        # strip unlimited-ocr bounding box annotations if present
+        stripped = _clean_ocr_line(stripped)
+        if not stripped:
+            continue
+
         if stripped.startswith('#'):
             stripped = stripped.lstrip('#').strip()
 
